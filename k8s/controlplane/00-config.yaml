@@ -20,6 +20,6 @@ kind: Secret
 metadata: { name: cps-secrets, namespace: shorebird }
 type: Opaque
 stringData:
-  API_KEY: "dev-api-key-change-me"
+  API_KEY: "f713b89646dbc2284b64cb6e86ff63f51b175ecfcd8fe31781521eb3fb1beded"
   URL_SIGNING_SECRET: "dev-url-signing-change-me"
   LOGIN_EMAIL: "dev@shorebird.local"
