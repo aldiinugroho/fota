@@ -1,0 +1,32 @@
+# Namespace + non-secret config + secret template.
+# Placeholders ($NS etc.) are filled by Jenkins via envsubst from values.env + creds.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $NS
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cps-config
+  namespace: $NS
+data:
+  PORT: "8080"
+  PUBLIC_BASE_URL: "https://$DOMAIN"
+  SHOREBIRD_JWT_ISSUER: "https://$DOMAIN"
+  CONSOLE_DIR: "/app/console"
+  DATA_DIR: "/data"
+  # trust the in-cluster ingress/pod ranges for X-Forwarded-For
+  TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+---
+# Secret values are envsubst-filled at deploy time (Jenkins credentials).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cps-secrets
+  namespace: $NS
+type: Opaque
+stringData:
+  API_KEY: "$API_KEY"
+  URL_SIGNING_SECRET: "$URL_SIGNING_SECRET"
+  LOGIN_EMAIL: "$ACME_EMAIL"

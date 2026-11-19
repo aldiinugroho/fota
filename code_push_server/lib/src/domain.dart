@@ -1,0 +1,200 @@
+// Domain model: lifecycle enums + transition guards, isolated from the
+// Shorebird wire DTOs (which live only at the HTTP boundary in api.dart).
+//
+// The state machines enforce the plan's invariants:
+//   Artifact:     pending -> uploading -> verified | failed
+//   Release:      draft -> uploading -> ready -> archived
+//   Patch:        draft -> uploading -> ready -> invalidated
+//   ChannelPatch: active -> withdrawn
+// Invalid transitions throw [ConflictException] (HTTP 409) — fail closed.
+
+/// Thrown for domain rule violations that map to a specific HTTP status.
+class DomainException implements Exception {
+  DomainException(this.statusCode, this.code, this.message);
+  final int statusCode;
+  final String code;
+  final String message;
+  @override
+  String toString() => 'DomainException($statusCode $code): $message';
+}
+
+DomainException conflict(String message) =>
+    DomainException(409, 'conflict', message);
+DomainException notFound(String message) =>
+    DomainException(404, 'not_found', message);
+DomainException badRequest(String message) =>
+    DomainException(400, 'bad_request', message);
+
+/// Parses a stored/submitted email-domain allowlist into normalized, lowercase
+/// domains with duplicates and blanks removed.
+///
+/// Accepts a comma- or whitespace-separated list, tolerating a leading `@` or a
+/// `*.` wildcard prefix on each entry (both are written by hand often enough to
+/// be worth accepting). Order is preserved so a round-trip reads back the way
+/// it was set. Returns an empty list for null/blank input, which every caller
+/// treats as "unrestricted".
+List<String> parseDomainList(String? raw) {
+  if (raw == null) return const [];
+  final out = <String>[];
+  for (final part in raw.split(RegExp(r'[,\s]+'))) {
+    var d = part.trim().toLowerCase();
+    if (d.startsWith('@')) d = d.substring(1);
+    if (d.startsWith('*.')) d = d.substring(2);
+    // A bare dot-less token can't be a mail domain, and anything with a slash,
+    // an `@`, or whitespace is a pasted address or URL rather than a domain.
+    if (d.isEmpty || !d.contains('.')) continue;
+    if (d.contains('/') || d.contains('@')) continue;
+    if (!out.contains(d)) out.add(d);
+  }
+  return out;
+}
+
+/// The domain part of [email], lowercased, or empty if it has no `@`.
+String emailDomain(String email) {
+  final at = email.lastIndexOf('@');
+  if (at < 0 || at == email.length - 1) return '';
+  return email.substring(at + 1).trim().toLowerCase();
+}
+
+/// Whether [email] is admissible to an org whose allowlist is [allowedDomains].
+///
+/// An empty allowlist admits everyone. Matching is exact on the domain — a
+/// policy of `example.com` does not admit `mail.example.com`, so an org can't
+/// be widened by a subdomain someone else controls.
+bool emailAllowedByDomains(String email, List<String> allowedDomains) {
+  if (allowedDomains.isEmpty) return true;
+  final d = emailDomain(email);
+  return d.isNotEmpty && allowedDomains.contains(d);
+}
+
+/// The `arch` value that marks a patch artifact as an **asset bundle** rather
+/// than code.
+///
+/// `artifacts.arch` is free-form (the create path takes whatever the CLI sends),
+/// which is why asset support needs no schema change: an asset bundle is just
+/// another artifact owned by the patch, tagged with this. Deliberately not a
+/// real architecture name, so it can never collide with one the CLI uploads
+/// (`aarch64`, `arm`, `x86_64`, …).
+const assetsArch = 'assets';
+
+/// A patch whose payload is Dart code, applied by the updater as a binary diff
+/// against the release snapshot. The only kind that existed before assets.
+const codePatchKind = 'code';
+
+/// A patch whose payload is assets and nothing else.
+///
+/// Exists so the engine's asset overlay can be delivered on platforms where
+/// shipping *code* needs the AOT linker — an assets-only patch has nothing to
+/// link or interpret, so it works on iOS with no linker at all.
+///
+/// **Only ever offered to a client that asks for it** (see
+/// `supported_patch_kinds` on `patches/check`). A stock updater handed one
+/// would try to apply an asset archive as a binary diff, fail to inflate, and
+/// tombstone the patch as permanently bad for that release.
+const assetsPatchKind = 'assets';
+
+/// The `arch` value that marks a patch artifact as **debug symbols**, retained
+/// so crash reports against that patch can be symbolicated.
+///
+/// Same reasoning as [assetsArch]: `arch` is free-form, so retention needs no
+/// schema change, and the name cannot collide with a real architecture.
+const symbolsArch = 'symbols';
+
+enum ArtifactStatus {
+  pending,
+  uploading,
+  verified,
+  failed;
+
+  static ArtifactStatus parse(String s) =>
+      ArtifactStatus.values.firstWhere((v) => v.name == s);
+}
+
+enum ReleaseLifecycle {
+  draft,
+  uploading,
+  ready,
+  archived;
+
+  static ReleaseLifecycle parse(String s) =>
+      ReleaseLifecycle.values.firstWhere((v) => v.name == s);
+}
+
+enum PatchStatus {
+  draft,
+  uploading,
+  ready,
+  invalidated;
+
+  static PatchStatus parse(String s) =>
+      PatchStatus.values.firstWhere((v) => v.name == s);
+}
+
+enum ChannelPatchStatus {
+  active,
+  withdrawn;
+
+  static ChannelPatchStatus parse(String s) =>
+      ChannelPatchStatus.values.firstWhere((v) => v.name == s);
+}
+
+/// Allowed forward transitions per machine. A transition to the same state is
+/// treated as idempotent and always allowed.
+const _artifactNext = {
+  ArtifactStatus.pending: {ArtifactStatus.uploading, ArtifactStatus.failed},
+  // uploading -> pending: the object store write threw, so nothing was stored
+  // and the same upload token is usable again. See `Api._upload`.
+  ArtifactStatus.uploading: {
+    ArtifactStatus.verified,
+    ArtifactStatus.failed,
+    ArtifactStatus.pending,
+  },
+  ArtifactStatus.verified: <ArtifactStatus>{},
+  ArtifactStatus.failed: <ArtifactStatus>{},
+};
+
+const _patchNext = {
+  PatchStatus.draft: {PatchStatus.uploading, PatchStatus.invalidated},
+  PatchStatus.uploading: {PatchStatus.ready, PatchStatus.invalidated},
+  // ready -> uploading: a multi-arch patch (e.g. macOS x86_64 + arm64, or
+  // Android arm/arm64/x64) registers each arch artifact sequentially; the patch
+  // may be marked ready after the first arch verifies, then re-opens when the
+  // next arch's artifact is registered.
+  PatchStatus.ready: {PatchStatus.uploading, PatchStatus.invalidated},
+  PatchStatus.invalidated: <PatchStatus>{},
+};
+
+// `withdrawn` is terminal for a patch that was rolled back (`rolled_back`).
+// The one exception is a row that promote superseded (`superseded = true`):
+// `Repository._restorePriorIn`, called only from the rollback paths, makes the
+// newest such row active again when the patch that superseded it is rolled
+// back. It bypasses this table on purpose, in SQL, and domain_test pins that
+// `withdrawn -> active` stays refused for every other caller.
+const _channelPatchNext = {
+  ChannelPatchStatus.active: {ChannelPatchStatus.withdrawn},
+  ChannelPatchStatus.withdrawn: <ChannelPatchStatus>{},
+};
+
+void requireArtifactTransition(ArtifactStatus from, ArtifactStatus to) {
+  if (from == to) return;
+  if (!_artifactNext[from]!.contains(to)) {
+    throw conflict('Artifact cannot go ${from.name} -> ${to.name}');
+  }
+}
+
+void requirePatchTransition(PatchStatus from, PatchStatus to) {
+  if (from == to) return;
+  if (!_patchNext[from]!.contains(to)) {
+    throw conflict('Patch cannot go ${from.name} -> ${to.name}');
+  }
+}
+
+void requireChannelPatchTransition(
+  ChannelPatchStatus from,
+  ChannelPatchStatus to,
+) {
+  if (from == to) return;
+  if (!_channelPatchNext[from]!.contains(to)) {
+    throw conflict('ChannelPatch cannot go ${from.name} -> ${to.name}');
+  }
+}

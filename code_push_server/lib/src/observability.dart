@@ -1,0 +1,252 @@
+import 'dart:convert';
+import 'dart:io';
+
+/// Process-wide log format, configured once at startup so every emitter — the
+/// request pipeline, migrations, the server lifecycle — agrees. When true, logs
+/// are one JSON object per line; otherwise human-readable text.
+bool _json = false;
+
+/// Sets the process-wide log format. Call once at startup (before anything
+/// logs). Defaults to text until called.
+void configureLogging({required bool json}) => _json = json;
+
+/// Whether JSON logging is currently active.
+bool get jsonLogging => _json;
+
+/// Where log lines are written.
+///
+/// Replaceable so a test can assert on the EXACT bytes an operator's log sink
+/// would receive. That matters for the audit trail specifically: "we never log
+/// secrets" is a claim about output, and the only way to measure it is to
+/// capture the output and search it. Production leaves this as stdout.
+void Function(String line) logSink = stdout.writeln;
+
+void _emit(Map<String, Object?> obj) => logSink(jsonEncode(obj));
+
+/// A structured info line (server lifecycle, migrations, housekeeping). In text
+/// mode [message] is printed verbatim, with any [fields] appended as `k=v`.
+void logInfo(String message, [Map<String, Object?> fields = const {}]) {
+  if (_json) {
+    _emit({'level': 'info', 'msg': message, ...fields});
+  } else if (fields.isEmpty) {
+    logSink(message);
+  } else {
+    final extra = fields.entries.map((e) => '${e.key}=${e.value}').join(' ');
+    logSink('$message $extra');
+  }
+}
+
+/// A structured error line. The stack trace goes to stderr in both modes.
+void logError(String message, Object error, StackTrace st) {
+  if (_json) {
+    _emit({'level': 'error', 'msg': message, 'error': '$error'});
+  } else {
+    logSink('  [error] $message: $error');
+  }
+  stderr.writeln(st);
+}
+
+/// Records + logs completed requests, and owns the metrics rendered at
+/// `GET /metrics`.
+///
+/// Metrics use the Prometheus text exposition format. Labels are kept
+/// low-cardinality (method + status class only — never the raw path) so they
+/// neither leak app ids nor explode the series count.
+class Observability {
+  Observability({required bool json}) {
+    configureLogging(json: json);
+  }
+
+  final Metrics metrics = Metrics();
+
+  /// Records + logs a completed request. Health/metrics probes are recorded but
+  /// not logged (they'd otherwise flood the log at the scrape interval).
+  ///
+  /// [requestId] is echoed to the caller in `X-Request-Id` and stored on any
+  /// audit event the request produced, so a log line, a client-side error and
+  /// an audit row can be tied together.
+  void request(
+    String method,
+    String path,
+    int status,
+    int durationMs, {
+    String? requestId,
+  }) {
+    metrics.record(method, status, durationMs);
+    if (_isProbe(path)) return;
+    if (_json) {
+      _emit({
+        'level': status >= 500 ? 'error' : 'info',
+        'msg': 'request',
+        'method': method,
+        'path': '/$path',
+        'status': status,
+        'duration_ms': durationMs,
+        if (requestId != null) 'request_id': requestId,
+      });
+    } else {
+      final rid = requestId == null ? '' : ' [$requestId]';
+      logSink('$method /$path -> $status (${durationMs}ms)$rid');
+    }
+  }
+
+  /// Emits one audit event to the operational log sink.
+  ///
+  /// The durable record is the `audit_log` table; this line is the shipped-log
+  /// copy, so an operator whose stack forwards stdout to a log system can query
+  /// mutations there too — and so an audit event still reaches an operator if
+  /// the database write is the thing that failed.
+  ///
+  /// In JSON mode the whole event is one object with `"msg":"audit"`, which is
+  /// the queryable form. In text mode it is a single `audit ` line of `k=v`
+  /// pairs; every value has already been through `auditSafeText`, so none of
+  /// them can contain a newline and forge a second line.
+  void audit(Map<String, Object?> event) {
+    metrics.auditEvents++;
+    if (_json) {
+      _emit({'level': 'info', 'msg': 'audit', ...event});
+      return;
+    }
+    final pairs = event.entries
+        .where((e) => e.value != null)
+        .map(
+          (e) => '${e.key}=${e.value is Map ? jsonEncode(e.value) : e.value}',
+        )
+        .join(' ');
+    logSink('audit $pairs');
+  }
+
+  /// Reports that an audit event could not be persisted to `audit_log`.
+  ///
+  /// Loud on purpose, and counted: the mutation has already happened by this
+  /// point, so refusing the response would not un-apply it. What must not
+  /// happen is that the gap goes unnoticed — a silently-missing row is what
+  /// makes "nothing was logged" mean nothing.
+  void auditWriteFailed(Map<String, Object?> event, Object err, StackTrace st) {
+    metrics.auditWriteFailures++;
+    logError('AUDIT WRITE FAILED (event emitted to log only)', err, st);
+    audit({...event, 'audit_persisted': false});
+  }
+
+  void error(String message, Object err, StackTrace st) =>
+      logError(message, err, st);
+
+  /// A structured info line (delegates to the top-level [logInfo]).
+  void info(String message, [Map<String, Object?> fields = const {}]) =>
+      logInfo(message, fields);
+
+  static bool _isProbe(String path) =>
+      path == 'healthz' || path == 'readyz' || path == 'metrics';
+}
+
+/// In-memory counters/histogram rendered in the Prometheus text format.
+class Metrics {
+  Metrics() : _start = DateTime.now();
+
+  final DateTime _start;
+
+  // method|statusClass -> count, e.g. "GET|2xx".
+  final Map<String, int> _requests = {};
+
+  // Cumulative-friendly duration histogram (seconds).
+  static const List<double> _le = [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1,
+    2.5,
+    5,
+    10,
+  ];
+  final List<int> _bucket = List<int>.filled(_le.length, 0);
+  int _durationCount = 0;
+  double _durationSum = 0;
+
+  int inFlight = 0;
+
+  /// Audit events emitted (log sink), and the subset whose `audit_log` write
+  /// failed. `code_push_audit_write_failures_total` above zero means the
+  /// durable trail has holes and is worth alerting on.
+  int auditEvents = 0;
+  int auditWriteFailures = 0;
+
+  /// Requests that carried an `X-Forwarded-For` from a peer not listed in
+  /// `TRUSTED_PROXIES`, so the header was ignored and the peer's own address
+  /// was used for rate limiting instead.
+  ///
+  /// Steadily non-zero means a real reverse proxy is missing from
+  /// `TRUSTED_PROXIES`: every client behind it shares one rate-limit bucket and
+  /// will start seeing 429s. Worth alerting on — unlike the accompanying log
+  /// line, this is not rate limited.
+  int untrustedForwardedFor = 0;
+
+  void record(String method, int status, int durationMs) {
+    final key = '$method|${status ~/ 100}xx';
+    _requests[key] = (_requests[key] ?? 0) + 1;
+    final secs = durationMs / 1000.0;
+    _durationSum += secs;
+    _durationCount++;
+    for (var i = 0; i < _le.length; i++) {
+      if (secs <= _le[i]) _bucket[i]++;
+    }
+  }
+
+  String render() {
+    final b = StringBuffer();
+    b.writeln('# HELP code_push_uptime_seconds Server uptime in seconds.');
+    b.writeln('# TYPE code_push_uptime_seconds gauge');
+    b.writeln(
+      'code_push_uptime_seconds ${DateTime.now().difference(_start).inSeconds}',
+    );
+    b.writeln('# HELP code_push_requests_in_flight In-flight HTTP requests.');
+    b.writeln('# TYPE code_push_requests_in_flight gauge');
+    b.writeln('code_push_requests_in_flight $inFlight');
+    b.writeln(
+      '# HELP code_push_requests_total HTTP requests by method/status.',
+    );
+    b.writeln('# TYPE code_push_requests_total counter');
+    _requests.forEach((k, v) {
+      final p = k.split('|');
+      b.writeln(
+        'code_push_requests_total{method="${p[0]}",status="${p[1]}"} $v',
+      );
+    });
+    b.writeln('# HELP code_push_request_duration_seconds Request duration.');
+    b.writeln('# TYPE code_push_request_duration_seconds histogram');
+    for (var i = 0; i < _le.length; i++) {
+      b.writeln(
+        'code_push_request_duration_seconds_bucket{le="${_le[i]}"} ${_bucket[i]}',
+      );
+    }
+    b.writeln(
+      'code_push_request_duration_seconds_bucket{le="+Inf"} $_durationCount',
+    );
+    b.writeln(
+      'code_push_request_duration_seconds_sum ${_durationSum.toStringAsFixed(6)}',
+    );
+    b.writeln('code_push_request_duration_seconds_count $_durationCount');
+    b.writeln(
+      '# HELP code_push_untrusted_forwarded_for_total Requests whose '
+      'X-Forwarded-For was ignored because the peer is not in TRUSTED_PROXIES.',
+    );
+    b.writeln('# TYPE code_push_untrusted_forwarded_for_total counter');
+    b.writeln('code_push_untrusted_forwarded_for_total $untrustedForwardedFor');
+    b.writeln(
+      '# HELP code_push_audit_events_total Control-plane mutation audit '
+      'events emitted.',
+    );
+    b.writeln('# TYPE code_push_audit_events_total counter');
+    b.writeln('code_push_audit_events_total $auditEvents');
+    b.writeln(
+      '# HELP code_push_audit_write_failures_total Audit events that could '
+      'not be persisted to audit_log.',
+    );
+    b.writeln('# TYPE code_push_audit_write_failures_total counter');
+    b.writeln('code_push_audit_write_failures_total $auditWriteFailures');
+    return b.toString();
+  }
+}

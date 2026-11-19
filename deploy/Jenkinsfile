@@ -1,0 +1,67 @@
+// Git -> Jenkins -> Kubernetes. SCM = THIS clean repo (e.g. aldiinugroho/shorebird-ota). Jenkinsfile location: deploy/Jenkinsfile
+// Agent 'docker' needs: docker, kubectl (kubeconfig + K8S_CONTEXT), git, envsubst (gettext)
+// ghcr-push credential: username = your GH user, password = a fine-grained PAT (packages: write)
+// Builds the control plane FROM THIS REPO's source (code_push_server/), bakes its console.
+pipeline {
+  agent { label 'docker' }
+  options { timestamps(); disableConcurrentBuilds() }
+  environment {
+    // fill these to your infra (or externalize to a shared library):
+    NS               = 'shorebird'
+    DOMAIN           = 'ota.yourdomain.com'
+    ACME_EMAIL       = 'you@yourdomain.com'
+    REGISTRY         = 'ghcr.io/aldiinugroho'
+    IMAGE            = 'shorebird-controlplane'
+    INGRESS_CLASS    = 'nginx'
+    STORAGE_CLASS    = 'standard'
+    IMAGE_PULL_SECRET= 'ghcr-pull'      // k8s Secret w/ registry creds; omit+strip if public pull
+    K8S_CONTEXT      = 'prod'
+  }
+  stages {
+    stage('Build + Push image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'ghcr-push',
+                                           usernameVariable: 'GH_USER',
+                                           passwordVariable: 'GH_TOKEN')]) {
+          sh '''
+            set -euo pipefail
+            TAG=$(git rev-parse --short HEAD)
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin >/dev/null
+            # build the control plane FROM THIS REPO's source (multi-stage; bakes code_push_server/console/)
+            docker build -t "$REGISTRY/$IMAGE:$TAG" -t "$REGISTRY/$IMAGE:latest" code_push_server/
+            docker push "$REGISTRY/$IMAGE:$TAG"
+            docker push "$REGISTRY/$IMAGE:latest"
+            echo "TAG=$TAG" > build.env
+            echo "pushed $REGISTRY/$IMAGE:$TAG"
+          '''
+        }
+      }
+    }
+    stage('Deploy to K8s') {
+      steps {
+        withCredentials([string(credentialsId: 'cps-api-key',            variable: 'API_KEY'),
+                         string(credentialsId: 'cps-url-signing-secret', variable: 'URL_SIGNING_SECRET')]) {
+          sh '''
+            set -euo pipefail
+            source build.env; export IMAGE_TAG="$TAG"
+            VARS='$NS $DOMAIN $ACME_EMAIL $REGISTRY $IMAGE $IMAGE_TAG $INGRESS_CLASS $STORAGE_CLASS $IMAGE_PULL_SECRET $API_KEY $URL_SIGNING_SECRET'
+            kubectl config use-context "$K8S_CONTEXT" >/dev/null
+            for f in deploy/manifests/00-config.yaml deploy/manifests/10-controlplane.yaml deploy/manifests/20-ingress.yaml; do
+              echo "apply $f"; envsubst "$VARS" < "$f" | kubectl apply -f -
+            done
+            kubectl -n "$NS" set image statefulset/cps=cps="$REGISTRY/$IMAGE:$TAG"
+            kubectl -n "$NS" rollout status statefulset/cps --timeout=240s
+          '''
+        }
+      }
+    }
+    stage('Smoke test') {
+      steps {
+        sh 'for i in $(seq 1 30); do curl -fsS "https://$DOMAIN/healthz" && { echo ok; exit 0; }; sleep 10; done; echo "healthz never came up"; exit 1'
+      }
+    }
+  }
+  post {
+    failure { echo "deploy failed: kubectl -n $NS logs statefulset/cps-cps-0 + check ingress controller + cert-manager" }
+  }
+}

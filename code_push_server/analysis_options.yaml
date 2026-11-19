@@ -1,0 +1,10 @@
+# Standard Dart recommended lints. This package keeps its own analysis config
+# (rather than the monorepo's very_good set) because it is standalone — its own
+# pubspec.lock, not a workspace member — but it follows the recommended lints.
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    # The DB abstraction returns Object? maps the repository casts explicitly
+    # (e.g. `m['id'] as int`); strict-casts is left off to avoid noise on those.
+    strict-casts: false
