@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: cps, namespace: shorebird }
+spec:
+  serviceName: cps
+  replicas: 1
+  selector:
+    matchLabels: { app: cps }
+  template:
+    metadata:
+      labels: { app: cps }
+    spec:
+      containers:
+        - name: cps
+          # local: kind-loaded (no registry). prod: <registry>/shorebird-controlplane:<sha>
+          image: shorebird-controlplane
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom:
+            - configMapRef: { name: cps-config }
+            - secretRef: { name: cps-secrets }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 30
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cps, namespace: shorebird, labels: { app: cps } }
+spec:
+  selector: { app: cps }
+  ports: [{ name: http, port: 80, targetPort: 8080 }]

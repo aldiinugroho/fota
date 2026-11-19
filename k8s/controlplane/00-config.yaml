@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shorebird
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: cps-config, namespace: shorebird }
+data:
+  PORT: "8080"
+  PUBLIC_BASE_URL: "https://shorebird.ota.local"
+  SHOREBIRD_JWT_ISSUER: "https://shorebird.ota.local"
+  CONSOLE_DIR: "/app/console"
+  DATA_DIR: "/data"
+  TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+---
+# LOCAL dev values. For prod, inject via ArgoCD from a sealed/vaulted Secret.
+apiVersion: v1
+kind: Secret
+metadata: { name: cps-secrets, namespace: shorebird }
+type: Opaque
+stringData:
+  API_KEY: "dev-api-key-change-me"
+  URL_SIGNING_SECRET: "dev-url-signing-change-me"
+  LOGIN_EMAIL: "dev@shorebird.local"

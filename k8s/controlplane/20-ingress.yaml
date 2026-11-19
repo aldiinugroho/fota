@@ -1,0 +1,36 @@
+# Local simu: self-signed TLS. For prod, swap the issuer to Let's Encrypt
+# (cert-manager.io/issuer: cps-letsencrypt + the HTTP01 solver) and set a real DOMAIN.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cps
+  namespace: shorebird
+  annotations:
+    cert-manager.io/issuer: cps-selfsigned
+    nginx.ingress.kubernetes.io/proxy-body-size: "512m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["shorebird.ota.local"]
+      secretName: cps-tls
+  rules:
+    - host: shorebird.ota.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: cps, port: { number: 80 } } }
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: { name: cps-selfsigned, namespace: shorebird }
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: cps-tls, namespace: shorebird }
+spec:
+  secretName: cps-tls
+  issuerRef: { name: cps-selfsigned }
+  dnsNames: ["shorebird.ota.local"]
